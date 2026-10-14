@@ -30,9 +30,7 @@ def withKube(Closure body) {
 }
 
 pipeline {
-    agent {
-        label 'tekuser-minikube'
-    }
+    agent any
 
     options {
         timeout(time: 45, unit: 'MINUTES')
