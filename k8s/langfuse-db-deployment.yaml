@@ -1,0 +1,91 @@
+# PREDEFINED - PostgreSQL database for Langfuse (internal only, no browser access)
+# Image: postgres:16.4-alpine (official). Load it with:
+#   docker pull postgres:16.4-alpine && minikube image load postgres:16.4-alpine
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: secureassist-langfuse-db-data
+  namespace: secureassist
+  labels:
+    app.kubernetes.io/name: secureassist-langfuse-db
+    app.kubernetes.io/part-of: secureassist
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secureassist-langfuse-db
+  namespace: secureassist
+  labels:
+    app.kubernetes.io/name: secureassist-langfuse-db
+    app.kubernetes.io/part-of: secureassist
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                    # a database volume must never be mounted by two Pods
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 180
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: secureassist-langfuse-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: secureassist-langfuse-db
+        app.kubernetes.io/part-of: secureassist
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70                 # "postgres" user in the alpine image
+        runAsGroup: 70
+        fsGroup: 70                   # makes the volume writable for that user
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16.4-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: secureassist-langfuse, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: secureassist-langfuse, key: POSTGRES_PASSWORD } }
+            - name: POSTGRES_DB
+              valueFrom: { secretKeyRef: { name: secureassist-langfuse, key: POSTGRES_DB } }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: run, mountPath: /var/run/postgresql }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: secureassist-langfuse-db-data
+        - name: run
+          emptyDir: {}

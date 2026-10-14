@@ -1,0 +1,64 @@
+# SecureAssist frontend (port 8091)
+# STUDENT TASK (Task 4): complete BACKEND_URL, ports and probes. Reference solution below.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secureassist-frontend
+  namespace: secureassist
+  labels:
+    app.kubernetes.io/name: secureassist-frontend
+    app.kubernetes.io/part-of: secureassist
+spec:
+  replicas: 1
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 120
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: secureassist-frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: secureassist-frontend
+        app.kubernetes.io/part-of: secureassist
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: secureassist-frontend:1.0
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8091
+          env:
+            - name: BACKEND_URL           # server-side proxy target (Kubernetes Service DNS)
+              value: "http://secureassist-backend:8092"
+            - name: PROXY_TIMEOUT
+              value: "150"
+          resources:
+            requests: { cpu: 50m, memory: 96Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}

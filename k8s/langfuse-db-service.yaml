@@ -1,0 +1,17 @@
+# PREDEFINED. In-cluster DNS name: secureassist-langfuse-db:5432 (used only by Langfuse)
+apiVersion: v1
+kind: Service
+metadata:
+  name: secureassist-langfuse-db
+  namespace: secureassist
+  labels:
+    app.kubernetes.io/name: secureassist-langfuse-db
+    app.kubernetes.io/part-of: secureassist
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: secureassist-langfuse-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

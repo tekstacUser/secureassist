@@ -1,0 +1,7 @@
+# PREDEFINED. All SecureAssist resources live in this namespace only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: secureassist
+  labels:
+    app.kubernetes.io/part-of: secureassist

@@ -1,0 +1,17 @@
+# STUDENT TASK (Task 4): reference solution. In-cluster DNS name: secureassist-backend
+apiVersion: v1
+kind: Service
+metadata:
+  name: secureassist-backend
+  namespace: secureassist
+  labels:
+    app.kubernetes.io/name: secureassist-backend
+    app.kubernetes.io/part-of: secureassist
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: secureassist-backend
+  ports:
+    - name: http
+      port: 8092
+      targetPort: http

@@ -1,0 +1,283 @@
+// SecureAssist CI/CD pipeline (PREDEFINED)
+//
+// Jenkins UI: http://<VM-IP>:3030  -> New Item -> Pipeline -> "secureassist"
+//   Definition: "Pipeline script from SCM", Script Path: cicd/Jenkinsfile
+//
+// Every stage runs plain CLI commands (docker, kubectl, minikube, python3, sonar-scanner).
+// No credentials are hard-coded: SonarQube URL/token come from Jenkins' SonarQube
+// server configuration (withSonarQubeEnv) and the optional kubeconfig from a Jenkins
+// "Secret file" credential. Any failing command stops the pipeline (no false success).
+
+def withKube(Closure body) {
+    if (params.KUBECONFIG_CREDENTIAL_ID?.trim()) {
+        withCredentials([file(credentialsId: params.KUBECONFIG_CREDENTIAL_ID.trim(), variable: 'KUBECONFIG')]) {
+            body()
+        }
+    } else {
+        body()   // use the Jenkins user's own ~/.kube/config
+    }
+}
+
+pipeline {
+    agent any
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_SONAR', defaultValue: true,
+            description: 'Run SonarQube analysis and enforce the quality gate')
+        string(name: 'SONARQUBE_SERVER', defaultValue: 'sonarqube',
+            description: 'Name of the SonarQube server in Manage Jenkins > System > SonarQube servers')
+        string(name: 'SONAR_SCANNER_TOOL', defaultValue: 'SonarScanner',
+            description: 'Name of the SonarQube Scanner in Manage Jenkins > Tools')
+        booleanParam(name: 'SONAR_GATE_VIA_SCANNER', defaultValue: false,
+            description: 'Tick if SonarQube has NO webhook to Jenkins: the scanner waits for the gate instead of waitForQualityGate')
+        booleanParam(name: 'DEPLOY', defaultValue: true,
+            description: 'Deploy to Minikube and run verification (untick = build and validate only)')
+        string(name: 'KUBECONFIG_CREDENTIAL_ID', defaultValue: '',
+            description: 'Optional Jenkins Secret-file credential holding a kubeconfig. Empty = Jenkins user\'s ~/.kube/config')
+    }
+
+    environment {
+        NS = 'secureassist'
+        IMAGE_TAG = '1.0'
+        POSTGRES_IMAGE = 'postgres:16.4-alpine'
+        PYTHONDONTWRITEBYTECODE = '1'
+    }
+
+    stages {
+        stage('1. Checkout') {
+            steps {
+                checkout scm
+                sh '''
+                    git log -1 --oneline || true
+                    test -f README.md && test -f cicd/Jenkinsfile
+                    mkdir -p reports
+                '''
+            }
+        }
+
+        stage('2. Environment and tool checks') {
+            steps {
+                withKube {
+                    sh '''
+                        set -u
+                        out=reports/capabilities.txt; : > "$out"; missing=0
+                        for t in python3 docker kubectl minikube git; do
+                          if command -v "$t" >/dev/null 2>&1; then echo "tool.$t=present" | tee -a "$out"
+                          else echo "tool.$t=MISSING" | tee -a "$out"; missing=1; fi
+                        done
+                        if docker info >/dev/null 2>&1; then echo "docker.access=yes" | tee -a "$out"
+                        else echo "docker.access=NO (add user $(id -un) to the docker group - administrator)" | tee -a "$out"; missing=1; fi
+                        if kubectl cluster-info >/dev/null 2>&1; then
+                          echo "kubernetes.reachable=yes (context $(kubectl config current-context))" | tee -a "$out"
+                          for verb in create patch get; do
+                            if kubectl auth can-i "$verb" deployments -n "$NS" >/dev/null 2>&1; then echo "kubernetes.can_${verb}_deployments=yes" | tee -a "$out"
+                            else echo "kubernetes.can_${verb}_deployments=NO" | tee -a "$out"; missing=1; fi
+                          done
+                        else echo "kubernetes.reachable=NO (no kubeconfig for $(id -un), or Minikube stopped)" | tee -a "$out"; missing=1; fi
+                        if minikube status >/dev/null 2>&1; then echo "minikube.running=yes" | tee -a "$out"
+                        else echo "minikube.running=NO (or not visible to $(id -un))" | tee -a "$out"; missing=1; fi
+                        if [ "$missing" -ne 0 ]; then
+                          echo "Environment checks FAILED - see reports/capabilities.txt"; exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('3. Code checks') {
+            steps {
+                sh '''
+                    set -eu
+                    files=$(find app mcp_server -name '*.py' -not -path '*/__pycache__/*' | sort)
+                    echo "Python syntax check:"; echo "$files"
+                    PYTHONPYCACHEPREFIX=reports/.pycache python3 -m py_compile $files
+                    rm -rf reports/.pycache
+                    echo "syntax OK: $(echo "$files" | wc -l) files" | tee reports/code-checks.txt
+
+                    echo "Backend must never execute anything (model output is text only):"
+                    if grep -nE '^[[:space:]]*(import|from)[[:space:]]+(subprocess|pty)([[:space:]]|$)|os[.]system[(]|os[.]popen[(]|(^|[^A-Za-z_])eval[(]|(^|[^A-Za-z_])exec[(]' app/backend/*.py; then
+                      echo "FAIL: execution primitive found in app/backend"; exit 1
+                    fi
+                    echo "no subprocess/os.system/eval/exec in app/backend" | tee -a reports/code-checks.txt
+
+                    echo "Committed-secret scan:"
+                    leaks=$(grep -RnE '(sk-lf-|pk-lf-)[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' \
+                              --exclude-dir=.git --exclude-dir=reports --exclude='.env' --exclude='*.example' . | grep -v REPLACE_ME || true)
+                    if [ -n "$leaks" ]; then echo "$leaks"; echo "FAIL: possible secret in source"; exit 1; fi
+                    echo "no secrets found in source files" | tee -a reports/code-checks.txt
+                '''
+            }
+        }
+
+        stage('4. SonarQube analysis') {
+            when { expression { return params.RUN_SONAR } }
+            steps {
+                script {
+                    // tool(...) fails the build clearly if the scanner is not configured in Jenkins
+                    env.SONAR_SCANNER = "${tool(params.SONAR_SCANNER_TOOL)}/bin/sonar-scanner"
+                    env.GATE_ARGS = params.SONAR_GATE_VIA_SCANNER ? '-Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300' : ''
+                }
+                // Injects SONAR_HOST_URL and SONAR_AUTH_TOKEN from the Jenkins configuration
+                withSonarQubeEnv(params.SONARQUBE_SERVER) {
+                    sh '''
+                        set -eu
+                        curl -fsS -m 10 "$SONAR_HOST_URL/api/system/status" | tee reports/sonar-server-status.json
+                        echo
+                        # run without a pipe so a scanner failure is never hidden (Jenkins sh has no pipefail)
+                        set +e
+                        SONAR_TOKEN="$SONAR_AUTH_TOKEN" "$SONAR_SCANNER" \
+                          -Dsonar.host.url="$SONAR_HOST_URL" \
+                          -Dsonar.projectVersion="$IMAGE_TAG-$BUILD_NUMBER" \
+                          $GATE_ARGS > reports/sonar-scanner-output.txt 2>&1
+                        rc=$?
+                        set -e
+                        cat reports/sonar-scanner-output.txt
+                        if [ -f .scannerwork/report-task.txt ]; then cp .scannerwork/report-task.txt reports/sonar-report-task.txt; fi
+                        if [ "$rc" -ne 0 ]; then echo "FAIL: SonarQube analysis (or scanner-side quality gate) failed, exit $rc"; exit "$rc"; fi
+                    '''
+                }
+            }
+        }
+
+        stage('5. SonarQube quality gate') {
+            when { expression { return params.RUN_SONAR && !params.SONAR_GATE_VIA_SCANNER } }
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    script {
+                        // Needs the SonarQube webhook: <JENKINS_URL>/sonarqube-webhook/
+                        def qg = waitForQualityGate()
+                        writeFile file: 'reports/sonar-quality-gate.txt',
+                                  text: "quality_gate=${qg.status}\nbuild=${env.BUILD_NUMBER}\ntime=${new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")}\n"
+                        if (qg.status != 'OK') {
+                            error "SonarQube quality gate failed: ${qg.status}. Open the project in SonarQube to see which conditions failed."
+                        }
+                        echo "SonarQube quality gate: ${qg.status}"
+                    }
+                }
+            }
+        }
+
+        stage('6. Build Docker images') {
+            steps {
+                sh '''
+                    set -eu
+                    docker build -t secureassist-frontend:$IMAGE_TAG app/frontend
+                    docker build -t secureassist-backend:$IMAGE_TAG  app/backend
+                    docker build -t secureassist-mcp:$IMAGE_TAG      mcp_server
+                    docker build -t secureassist-langfuse:$IMAGE_TAG langfuse
+                    docker pull $POSTGRES_IMAGE
+                    : > reports/images.txt
+                    for i in frontend backend mcp langfuse; do
+                      docker image inspect secureassist-$i:$IMAGE_TAG \
+                        --format "secureassist-$i:$IMAGE_TAG id={{.Id}} user={{.Config.User}} ports={{json .Config.ExposedPorts}}" \
+                        | tee -a reports/images.txt
+                    done
+                    echo "$POSTGRES_IMAGE pulled" | tee -a reports/images.txt
+                '''
+            }
+        }
+
+        stage('7. Load images into Minikube') {
+            steps {
+                withKube {
+                    sh '''
+                        set -eu
+                        for img in secureassist-frontend:$IMAGE_TAG secureassist-backend:$IMAGE_TAG \
+                                   secureassist-mcp:$IMAGE_TAG secureassist-langfuse:$IMAGE_TAG $POSTGRES_IMAGE; do
+                          minikube image load "$img" --overwrite=true
+                        done
+                        minikube image ls > reports/minikube-images-all.txt
+                        grep -E "secureassist-(frontend|backend|mcp|langfuse):$IMAGE_TAG|postgres:16.4-alpine" \
+                          reports/minikube-images-all.txt | tee reports/minikube-images.txt
+                        test "$(wc -l < reports/minikube-images.txt)" -ge 5 || { echo "FAIL: not all 5 images are in Minikube"; exit 1; }
+                    '''
+                }
+            }
+        }
+
+        stage('8. Validate Kubernetes manifests') {
+            steps {
+                withKube {
+                    sh '''
+                        set -eu
+                        # secrets-template.yaml is deliberately NOT validated or applied
+                        MANIFESTS="k8s/namespace.yaml
+                          k8s/langfuse-db-deployment.yaml k8s/langfuse-db-service.yaml
+                          k8s/langfuse-deployment.yaml k8s/langfuse-service.yaml
+                          k8s/mcp-deployment.yaml k8s/mcp-service.yaml
+                          k8s/backend-deployment.yaml k8s/backend-service.yaml
+                          k8s/frontend-deployment.yaml k8s/frontend-service.yaml"
+                        for f in $MANIFESTS; do kubectl apply --dry-run=client -f "$f" >/dev/null; echo "client OK  $f"; done
+                        if kubectl get namespace "$NS" >/dev/null 2>&1; then
+                          for f in $MANIFESTS; do kubectl apply --dry-run=server -f "$f" >/dev/null; echo "server OK  $f"; done
+                        fi
+                        if grep -RnE 'privileged:[[:space:]]*true' k8s/; then echo "FAIL: privileged container"; exit 1; fi
+                        if grep -RnE '(pk|sk)-lf-[A-Za-z0-9]{8,}' k8s/ | grep -v REPLACE_ME; then echo "FAIL: possible real key in k8s/"; exit 1; fi
+                    '''
+                }
+            }
+        }
+
+        stage('9. Deploy to Minikube') {
+            when { expression { return params.DEPLOY } }
+            steps {
+                withKube {
+                    sh '''
+                        set -eu
+                        kubectl apply -f k8s/namespace.yaml
+                        if ! kubectl -n "$NS" get secret secureassist-langfuse >/dev/null 2>&1; then
+                          echo "FAIL: Secret secureassist-langfuse not found. Create it once from langfuse/.env (README Task 4); it is never stored in Git."
+                          exit 1
+                        fi
+                        kubectl apply -f k8s/langfuse-db-deployment.yaml -f k8s/langfuse-db-service.yaml
+                        kubectl apply -f k8s/langfuse-deployment.yaml    -f k8s/langfuse-service.yaml
+                        kubectl apply -f k8s/mcp-deployment.yaml         -f k8s/mcp-service.yaml
+                        kubectl apply -f k8s/backend-deployment.yaml     -f k8s/backend-service.yaml
+                        kubectl apply -f k8s/frontend-deployment.yaml    -f k8s/frontend-service.yaml
+                        # same tag 1.0 + imagePullPolicy Never -> restart so Pods use the freshly loaded images
+                        for d in langfuse mcp backend frontend; do
+                          kubectl -n "$NS" rollout restart deployment/secureassist-$d
+                        done
+                        for d in langfuse-db langfuse mcp backend frontend; do
+                          if ! kubectl -n "$NS" rollout status deployment/secureassist-$d --timeout=420s; then
+                            kubectl -n "$NS" get pods -o wide || true
+                            kubectl -n "$NS" get events --sort-by=.lastTimestamp | tail -n 20 || true
+                            echo "FAIL: rollout of secureassist-$d did not complete"; exit 1
+                          fi
+                        done
+                        kubectl -n "$NS" get deploy,pods,svc,pvc -o wide | tee reports/k8s-status.txt
+                    '''
+                }
+            }
+        }
+
+        stage('10. Deployment and health checks') {
+            when { expression { return params.DEPLOY } }
+            steps {
+                withKube {
+                    // pipeline mode: skips the two student-written records, stops its temporary port-forwards
+                    sh 'VERIFY_MODE=pipeline bash scripts/verify-deployment.sh'
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Build evidence: capabilities, code checks, Sonar output, image list, k8s status, verification report
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true, fingerprint: true
+        }
+        success {
+            echo 'SecureAssist pipeline PASSED - evidence archived under "Build Artifacts" (reports/).'
+        }
+        failure {
+            echo 'SecureAssist pipeline FAILED - open the first red stage in the console output.'
+        }
+    }
+}

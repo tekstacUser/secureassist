@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SecureAssist — Enterprise AI Helpdesk</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">🛡️</span> SecureAssist <small>Enterprise AI Helpdesk</small></div>
+    <div class="model">Model: phi3:mini · Tools via MCP</div>
+  </header>
+
+  <main class="chat">
+    <div id="history" class="history" aria-live="polite">
+      <div class="msg bot">
+        <div class="bubble">Hello! I'm SecureAssist. Ask me an IT support question, for example
+          <em>"How do I reset my password?"</em> or <em>"Is the VPN service down?"</em></div>
+      </div>
+    </div>
+
+    <div id="status" class="status hidden"></div>
+
+    <form id="chat-form" class="composer" autocomplete="off">
+      <input id="message" type="text" maxlength="1000" placeholder="Type your IT question…" aria-label="Message">
+      <button id="send" type="submit">Send</button>
+    </form>
+    <p class="note">Do not enter passwords or personal data. Answers are guidance only.</p>
+  </main>
+
+  <script src="{{ url_for('static', filename='chat.js') }}"></script>
+</body>
+</html>

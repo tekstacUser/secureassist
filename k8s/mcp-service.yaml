@@ -1,0 +1,17 @@
+# PREDEFINED. In-cluster DNS name: secureassist-mcp (full: secureassist-mcp.secureassist.svc.cluster.local)
+apiVersion: v1
+kind: Service
+metadata:
+  name: secureassist-mcp
+  namespace: secureassist
+  labels:
+    app.kubernetes.io/name: secureassist-mcp
+    app.kubernetes.io/part-of: secureassist
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: secureassist-mcp
+  ports:
+    - name: http
+      port: 8093        # Service port (what clients inside the cluster use)
+      targetPort: http  # container port 8093

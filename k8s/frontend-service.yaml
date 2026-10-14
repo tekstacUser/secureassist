@@ -1,0 +1,20 @@
+# STUDENT TASK (Task 4): reference solution.
+# ClusterIP Service on 8091. The browser reaches it through
+#   kubectl port-forward --address 0.0.0.0 -n secureassist svc/secureassist-frontend 8091:8091
+# so the VM port is also 8091.
+apiVersion: v1
+kind: Service
+metadata:
+  name: secureassist-frontend
+  namespace: secureassist
+  labels:
+    app.kubernetes.io/name: secureassist-frontend
+    app.kubernetes.io/part-of: secureassist
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: secureassist-frontend
+  ports:
+    - name: http
+      port: 8091
+      targetPort: http
