@@ -1,33 +1,21 @@
-/*
- * SecureAssist CI/CD pipeline
- * Repository: https://github.com/tekstacUser/secureassist.git
- * Jenkins job: SecureAssist
- * Script path: cicd/Jenkinsfile
- *
- * Jenkins agent: tekuser-minikube
- * Agent operating-system user: tekuser
- * Kubernetes config: /etc/kubernetes/shared/config
- * Minikube profile: minikube
- * Minikube home: /home/tekuser/.minikube
- *
- * No sudo commands are used in this pipeline.
- * The existing Minikube cluster and images are preserved.
- */
-
-def withKube(Closure body) {
-    if (params.KUBECONFIG_CREDENTIAL_ID?.trim()) {
-        withCredentials([
-            file(
-                credentialsId: params.KUBECONFIG_CREDENTIAL_ID.trim(),
-                variable: 'KUBECONFIG'
-            )
-        ]) {
-            body()
-        }
-    } else {
-        body()
-    }
-}
+// SecureAssist CI/CD Pipeline
+//
+// Jenkins job: SecureAssist
+// Repository: https://github.com/tekstacUser/secureassist.git
+// Script Path: cicd/Jenkinsfile
+//
+// Jenkins controller/executor: jenkins
+// Docker builds and Minikube operations: tekuser
+//
+// Prerequisite:
+// /usr/local/bin/secureassist-ci must be installed and executable.
+// Jenkins must have passwordless permission to execute ONLY this helper
+// as tekuser. Do not grant unrestricted sudo permissions.
+//
+// Helper actions:
+// check, build, load, validate, deploy, verify
+//
+// Existing Minikube cluster and credentials remain owned by tekuser.
 
 pipeline {
     agent any
@@ -36,58 +24,50 @@ pipeline {
         timeout(time: 45, unit: 'MINUTES')
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '10'))
-        timestamps()
     }
 
     parameters {
         booleanParam(
             name: 'RUN_SONAR',
             defaultValue: true,
-            description: 'Run SonarQube analysis and enforce the Quality Gate'
+            description: 'Run SonarQube analysis and enforce the quality gate'
         )
 
         string(
             name: 'SONARQUBE_SERVER',
             defaultValue: 'sonarqube',
-            description: 'Name configured under Manage Jenkins > System'
+            description: 'Name configured in Manage Jenkins > System > SonarQube servers'
         )
 
         string(
             name: 'SONAR_SCANNER_TOOL',
             defaultValue: 'SonarScanner',
-            description: 'Name configured under Manage Jenkins > Tools'
+            description: 'Name configured in Manage Jenkins > Tools'
         )
 
         booleanParam(
             name: 'SONAR_GATE_VIA_SCANNER',
             defaultValue: false,
-            description: 'Enable scanner-side gate waiting when the Jenkins webhook is unavailable'
+            description: 'Enable if SonarQube has no Jenkins webhook'
         )
 
         booleanParam(
             name: 'DEPLOY',
-            defaultValue: false,
-            description: 'Deploy and verify SecureAssist after validation succeeds'
-        )
-
-        string(
-            name: 'KUBECONFIG_CREDENTIAL_ID',
-            defaultValue: '',
-            description: 'Optional Jenkins Secret-file credential ID; empty uses the shared kubeconfig'
+            defaultValue: true,
+            description: 'Deploy to Minikube and run verification'
         )
     }
 
     environment {
-        KUBECONFIG = '/etc/kubernetes/shared/config'
-        MINIKUBE_HOME = '/home/tekuser/.minikube'
-
         NS = 'secureassist'
         IMAGE_TAG = '1.0'
         POSTGRES_IMAGE = 'postgres:16.4-alpine'
         PYTHONDONTWRITEBYTECODE = '1'
+        SECUREASSIST_HELPER = '/usr/local/bin/secureassist-ci'
     }
 
     stages {
+
         stage('1. Checkout') {
             steps {
                 checkout scm
@@ -95,12 +75,15 @@ pipeline {
                 sh '''
                     set -eu
 
-                    echo "========== Checkout =========="
-                    git log -1 --oneline
+                    git log -1 --oneline || true
 
                     test -f README.md
                     test -f cicd/Jenkinsfile
-                    test -f sonar-project.properties
+                    test -d app/frontend
+                    test -d app/backend
+                    test -d mcp_server
+                    test -d langfuse
+                    test -d k8s
 
                     mkdir -p reports
                 '''
@@ -109,104 +92,25 @@ pipeline {
 
         stage('2. Environment and tool checks') {
             steps {
-                withKube {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
 
-                        mkdir -p reports
-                        OUT=reports/capabilities.txt
-                        : > "$OUT"
+                    test -x "$SECUREASSIST_HELPER" || {
+                        echo "FAIL: $SECUREASSIST_HELPER is missing or not executable"
+                        exit 1
+                    }
 
-                        MISSING=0
-
-                        echo "========== Agent identity =========="
-                        id
-                        echo "HOME=$HOME"
-
-                        if [ "$(id -un)" != "tekuser" ]; then
-                            echo "ERROR: This job must run as tekuser."
-                            echo "Actual user: $(id -un)"
+                    # Verify the narrowly scoped privilege works without a prompt.
+                    sudo -n -u tekuser \
+                        "$SECUREASSIST_HELPER" check "$WORKSPACE" \
+                        > reports/capabilities.txt 2>&1 || {
+                            cat reports/capabilities.txt
+                            echo "FAIL: tekuser environment checks failed"
                             exit 1
-                        fi
+                        }
 
-                        for T in python3 docker kubectl minikube git curl; do
-                            if command -v "$T" >/dev/null 2>&1; then
-                                echo "tool.$T=present" | tee -a "$OUT"
-                            else
-                                echo "tool.$T=MISSING" | tee -a "$OUT"
-                                MISSING=1
-                            fi
-                        done
-
-                        echo "identity.user=$(id -un)" | tee -a "$OUT"
-                        echo "identity.home=$HOME" | tee -a "$OUT"
-                        echo "kubeconfig=$KUBECONFIG" | tee -a "$OUT"
-                        echo "minikube.home=$MINIKUBE_HOME" | tee -a "$OUT"
-
-                        if [ ! -r "$KUBECONFIG" ]; then
-                            echo "ERROR: kubeconfig is not readable."
-                            MISSING=1
-                        else
-                            echo "kubeconfig.readable=yes" | tee -a "$OUT"
-                        fi
-
-                        if docker info >/dev/null 2>&1; then
-                            echo "docker.access=yes" | tee -a "$OUT"
-                        else
-                            echo "docker.access=NO" | tee -a "$OUT"
-                            MISSING=1
-                        fi
-
-                        if kubectl cluster-info > reports/cluster-info.txt 2>&1; then
-                            echo "kubernetes.reachable=yes" | tee -a "$OUT"
-                            kubectl config current-context | tee -a "$OUT"
-
-                            if kubectl auth can-i get deployments -n "$NS" |
-                                grep -qx yes; then
-                                echo "kubernetes.can_get_deployments=yes" |
-                                    tee -a "$OUT"
-                            else
-                                echo "kubernetes.can_get_deployments=NO" |
-                                    tee -a "$OUT"
-                                MISSING=1
-                            fi
-
-                            for VERB in create patch; do
-                                if kubectl auth can-i "$VERB" deployments -n "$NS" |
-                                    grep -qx yes; then
-                                    echo "kubernetes.can_${VERB}_deployments=yes" |
-                                        tee -a "$OUT"
-                                else
-                                    echo "kubernetes.can_${VERB}_deployments=NO" |
-                                        tee -a "$OUT"
-                                    MISSING=1
-                                fi
-                            done
-                        else
-                            cat reports/cluster-info.txt
-                            echo "kubernetes.reachable=NO" | tee -a "$OUT"
-                            MISSING=1
-                        fi
-
-                        if minikube -p minikube status \
-                            > reports/minikube-status.txt 2>&1; then
-                            echo "minikube.profile_status=available" |
-                                tee -a "$OUT"
-                        else
-                            cat reports/minikube-status.txt
-                            echo "minikube.profile_status=UNAVAILABLE" |
-                                tee -a "$OUT"
-                            MISSING=1
-                        fi
-
-                        if [ "$MISSING" -ne 0 ]; then
-                            echo "Environment checks FAILED."
-                            exit 1
-                        fi
-
-                        echo "Environment checks passed." | tee -a "$OUT"
-                    '''
-                }
+                    cat reports/capabilities.txt
+                '''
             }
         }
 
@@ -215,52 +119,61 @@ pipeline {
                 sh '''
                     set -eu
 
-                    FILES=$(find app mcp_server \
-                        -type f -name '*.py' \
+                    files=$(find app mcp_server \
+                        -name '*.py' \
                         -not -path '*/__pycache__/*' | sort)
 
-                    test -n "$FILES"
-                    printf '%s\\n' "$FILES" > reports/python-files.txt
+                    test -n "$files"
 
-                    while IFS= read -r F; do
-                        PYTHONPYCACHEPREFIX=reports/.pycache \
-                            python3 -m py_compile "$F"
-                    done < reports/python-files.txt
+                    echo "Python syntax check:"
+                    echo "$files"
+
+                    PYTHONPYCACHEPREFIX=reports/.pycache \
+                        python3 -m py_compile $files
 
                     rm -rf reports/.pycache
 
-                    echo "Python syntax checks passed." |
-                        tee reports/code-checks.txt
+                    echo "syntax OK: $(echo "$files" | wc -l) files" \
+                        | tee reports/code-checks.txt
+
+                    echo "Checking backend for unsafe execution primitives"
 
                     if grep -nE \
-                      '^[[:space:]]*(import|from)[[:space:]]+(subprocess|pty)([[:space:]]|$)|os[.]system[(]|os[.]popen[(]|(^|[^A-Za-z_])eval[(]|(^|[^A-Za-z_])exec[(]' \
-                      app/backend/*.py; then
-                        echo "FAIL: execution primitive found."
+                        '^[[:space:]]*(import|from)[[:space:]]+(subprocess|pty)([[:space:]]|$)|os[.]system[(]|os[.]popen[(]|(^|[^A-Za-z_])eval[(]|(^|[^A-Za-z_])exec[(]' \
+                        app/backend/*.py; then
+                        echo "FAIL: execution primitive found in app/backend"
                         exit 1
                     fi
 
-                    echo "No prohibited execution primitives found." |
-                        tee -a reports/code-checks.txt
+                    echo "No prohibited execution primitives found" \
+                        | tee -a reports/code-checks.txt
 
-                    LEAKS=$(git grep -nEI \
-                      '(sk-lf-|pk-lf-)[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' \
-                      -- ':!*.example' ':!*.md' || true)
+                    echo "Scanning committed source for possible secrets"
 
-                    if [ -n "$LEAKS" ]; then
-                        echo "$LEAKS"
-                        echo "FAIL: possible committed secret."
+                    leaks=$(grep -RnE \
+                        '(sk-lf-|pk-lf-)[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' \
+                        --exclude-dir=.git \
+                        --exclude-dir=reports \
+                        --exclude-dir=.scannerwork \
+                        --exclude='.env' \
+                        --exclude='*.example' \
+                        . | grep -v REPLACE_ME || true)
+
+                    if [ -n "$leaks" ]; then
+                        echo "$leaks"
+                        echo "FAIL: possible secret in source"
                         exit 1
                     fi
 
-                    echo "No likely committed secrets found." |
-                        tee -a reports/code-checks.txt
+                    echo "No matching committed secrets found" \
+                        | tee -a reports/code-checks.txt
                 '''
             }
         }
 
         stage('4. SonarQube analysis') {
             when {
-                expression { params.RUN_SONAR }
+                expression { return params.RUN_SONAR }
             }
 
             steps {
@@ -279,21 +192,21 @@ pipeline {
 
                         curl -fsS -m 10 \
                             "$SONAR_HOST_URL/api/system/status" \
-                            > reports/sonar-server-status.json
+                            | tee reports/sonar-server-status.json
 
-                        cat reports/sonar-server-status.json
                         echo
 
                         set +e
+
                         SONAR_TOKEN="$SONAR_AUTH_TOKEN" \
                             "$SONAR_SCANNER" \
                             -Dsonar.host.url="$SONAR_HOST_URL" \
-                            -Dsonar.projectKey=secureassist \
                             -Dsonar.projectVersion="$IMAGE_TAG-$BUILD_NUMBER" \
                             $GATE_ARGS \
                             > reports/sonar-scanner-output.txt 2>&1
 
-                        RC=$?
+                        rc=$?
+
                         set -e
 
                         cat reports/sonar-scanner-output.txt
@@ -303,9 +216,9 @@ pipeline {
                                 reports/sonar-report-task.txt
                         fi
 
-                        if [ "$RC" -ne 0 ]; then
-                            echo "SonarQube analysis or Quality Gate failed."
-                            exit "$RC"
+                        if [ "$rc" -ne 0 ]; then
+                            echo "FAIL: SonarQube analysis failed with exit $rc"
+                            exit "$rc"
                         fi
                     '''
                 }
@@ -315,267 +228,128 @@ pipeline {
         stage('5. SonarQube quality gate') {
             when {
                 expression {
-                    params.RUN_SONAR &&
-                    !params.SONAR_GATE_VIA_SCANNER
+                    return params.RUN_SONAR &&
+                        !params.SONAR_GATE_VIA_SCANNER
                 }
             }
 
             steps {
                 timeout(time: 5, unit: 'MINUTES') {
                     script {
-                        def QG = waitForQualityGate()
+                        def qg = waitForQualityGate()
 
                         writeFile(
                             file: 'reports/sonar-quality-gate.txt',
-                            text: "quality_gate=${QG.status}\nbuild=${env.BUILD_NUMBER}\n"
+                            text: "quality_gate=${qg.status}\nbuild=${env.BUILD_NUMBER}\ntime=${new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")}\n"
                         )
 
-                        if (QG.status != 'OK') {
-                            error("SonarQube Quality Gate failed: ${QG.status}")
+                        if (qg.status != 'OK') {
+                            error(
+                                "SonarQube quality gate failed: ${qg.status}"
+                            )
                         }
 
-                        echo 'SonarQube Quality Gate passed.'
+                        echo "SonarQube quality gate: ${qg.status}"
                     }
                 }
             }
         }
 
-        stage('6. Build Docker images') {
+        stage('6. Build Docker images as tekuser') {
             steps {
                 sh '''
                     set -eu
 
-                    test -f app/frontend/Dockerfile
-                    test -f app/backend/Dockerfile
-                    test -f mcp_server/Dockerfile
-                    test -f langfuse/Dockerfile
+                    sudo -n -u tekuser \
+                        "$SECUREASSIST_HELPER" build "$WORKSPACE" \
+                        > reports/images.txt 2>&1 || {
+                            cat reports/images.txt
+                            echo "FAIL: Docker image build failed"
+                            exit 1
+                        }
 
-                    echo "========== Build SecureAssist images =========="
-
-                    docker build \
-                        -t secureassist-frontend:$IMAGE_TAG \
-                        app/frontend
-
-                    docker build \
-                        -t secureassist-backend:$IMAGE_TAG \
-                        app/backend
-
-                    docker build \
-                        -t secureassist-mcp:$IMAGE_TAG \
-                        mcp_server
-
-                    docker build \
-                        -t secureassist-langfuse:$IMAGE_TAG \
-                        langfuse
-
-                    echo "========== Pull PostgreSQL image =========="
-                    docker pull "$POSTGRES_IMAGE"
-
-                    : > reports/images.txt
-
-                    for I in frontend backend mcp langfuse; do
-                        docker image inspect \
-                            "secureassist-$I:$IMAGE_TAG" \
-                            --format \
-                            "secureassist-$I:$IMAGE_TAG id={{.Id}} user={{.Config.User}} ports={{json .Config.ExposedPorts}}" \
-                            | tee -a reports/images.txt
-                    done
-
-                    docker image inspect "$POSTGRES_IMAGE" \
-                        --format 'postgres image id={{.Id}}' \
-                        | tee -a reports/images.txt
+                    cat reports/images.txt
                 '''
             }
         }
 
-        stage('7. Load images into Minikube') {
+        stage('7. Load images into Minikube as tekuser') {
             steps {
-                withKube {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
 
-                        echo "========== Existing Minikube profile =========="
-                        minikube -p minikube status
+                    sudo -n -u tekuser \
+                        "$SECUREASSIST_HELPER" load "$WORKSPACE" \
+                        > reports/minikube-images.txt 2>&1 || {
+                            cat reports/minikube-images.txt
+                            echo "FAIL: Minikube image loading failed"
+                            exit 1
+                        }
 
-                        for IMG in \
-                            "secureassist-frontend:$IMAGE_TAG" \
-                            "secureassist-backend:$IMAGE_TAG" \
-                            "secureassist-mcp:$IMAGE_TAG" \
-                            "secureassist-langfuse:$IMAGE_TAG" \
-                            "$POSTGRES_IMAGE"; do
-
-                            docker image inspect "$IMG" >/dev/null
-
-                            echo "Loading image: $IMG"
-
-                            minikube -p minikube image load \
-                                --overwrite=true "$IMG"
-                        done
-
-                        minikube -p minikube image ls \
-                            > reports/minikube-images-all.txt
-
-                        for IMG in \
-                            "secureassist-frontend:$IMAGE_TAG" \
-                            "secureassist-backend:$IMAGE_TAG" \
-                            "secureassist-mcp:$IMAGE_TAG" \
-                            "secureassist-langfuse:$IMAGE_TAG" \
-                            "$POSTGRES_IMAGE"; do
-
-                            if ! grep -Fq "$IMG" \
-                                reports/minikube-images-all.txt; then
-                                echo "ERROR: Image not found in Minikube: $IMG"
-                                exit 1
-                            fi
-                        done
-
-                        cp reports/minikube-images-all.txt \
-                            reports/minikube-images.txt
-
-                        echo "All five images are available in Minikube."
-                    '''
-                }
+                    cat reports/minikube-images.txt
+                '''
             }
         }
 
-        stage('8. Validate Kubernetes manifests') {
+        stage('8. Validate Kubernetes manifests as tekuser') {
             steps {
-                withKube {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
 
-                        MANIFESTS="
-                        k8s/namespace.yaml
-                        k8s/langfuse-db-deployment.yaml
-                        k8s/langfuse-db-service.yaml
-                        k8s/langfuse-deployment.yaml
-                        k8s/langfuse-service.yaml
-                        k8s/mcp-deployment.yaml
-                        k8s/mcp-service.yaml
-                        k8s/backend-deployment.yaml
-                        k8s/backend-service.yaml
-                        k8s/frontend-deployment.yaml
-                        k8s/frontend-service.yaml
-                        "
-
-                        for F in $MANIFESTS; do
-                            test -f "$F"
-                            kubectl apply --dry-run=client -f "$F" >/dev/null
-                            echo "Client validation OK: $F"
-                        done
-
-                        if kubectl get namespace "$NS" >/dev/null 2>&1; then
-                            for F in $MANIFESTS; do
-                                kubectl apply --dry-run=server -f "$F" >/dev/null
-                                echo "Server validation OK: $F"
-                            done
-                        fi
-
-                        if grep -RnE \
-                            'privileged:[[:space:]]*true' k8s/; then
-                            echo "FAIL: privileged container configuration."
+                    sudo -n -u tekuser \
+                        "$SECUREASSIST_HELPER" validate "$WORKSPACE" \
+                        > reports/manifest-validation.txt 2>&1 || {
+                            cat reports/manifest-validation.txt
+                            echo "FAIL: Kubernetes manifest validation failed"
                             exit 1
-                        fi
+                        }
 
-                        if grep -RnE \
-                            '(pk|sk)-lf-[A-Za-z0-9]{8,}' k8s/ |
-                            grep -v 'REPLACE_ME'; then
-                            echo "FAIL: possible real Langfuse key in manifests."
-                            exit 1
-                        fi
-
-                        echo "Kubernetes manifest validation passed." |
-                            tee reports/k8s-validation.txt
-                    '''
-                }
+                    cat reports/manifest-validation.txt
+                '''
             }
         }
 
-        stage('9. Deploy to Minikube') {
+        stage('9. Deploy to Minikube as tekuser') {
             when {
-                expression { params.DEPLOY }
+                expression { return params.DEPLOY }
             }
 
             steps {
-                withKube {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
 
-                        echo "========== Deploy SecureAssist =========="
-
-                        minikube -p minikube status
-
-                        kubectl apply -f k8s/namespace.yaml
-
-                        if ! kubectl -n "$NS" get secret \
-                            secureassist-langfuse >/dev/null 2>&1; then
-                            echo "ERROR: Required secret secureassist-langfuse is missing."
-                            echo "Create the documented secret before deploying."
+                    sudo -n -u tekuser \
+                        "$SECUREASSIST_HELPER" deploy "$WORKSPACE" \
+                        > reports/k8s-status.txt 2>&1 || {
+                            cat reports/k8s-status.txt
+                            echo "FAIL: SecureAssist deployment failed"
                             exit 1
-                        fi
+                        }
 
-                        kubectl apply \
-                            -f k8s/langfuse-db-deployment.yaml \
-                            -f k8s/langfuse-db-service.yaml
-
-                        kubectl apply \
-                            -f k8s/langfuse-deployment.yaml \
-                            -f k8s/langfuse-service.yaml
-
-                        kubectl apply \
-                            -f k8s/mcp-deployment.yaml \
-                            -f k8s/mcp-service.yaml
-
-                        kubectl apply \
-                            -f k8s/backend-deployment.yaml \
-                            -f k8s/backend-service.yaml
-
-                        kubectl apply \
-                            -f k8s/frontend-deployment.yaml \
-                            -f k8s/frontend-service.yaml
-
-                        for D in langfuse mcp backend frontend; do
-                            kubectl -n "$NS" rollout restart \
-                                "deployment/secureassist-$D"
-                        done
-
-                        for D in langfuse-db langfuse mcp backend frontend; do
-                            if ! kubectl -n "$NS" rollout status \
-                                "deployment/secureassist-$D" \
-                                --timeout=420s; then
-
-                                kubectl -n "$NS" get pods -o wide || true
-                                kubectl -n "$NS" get events \
-                                    --sort-by=.lastTimestamp | tail -n 30 || true
-
-                                echo "Deployment failed: secureassist-$D"
-                                exit 1
-                            fi
-                        done
-
-                        kubectl -n "$NS" get deploy,pods,svc,pvc -o wide \
-                            | tee reports/k8s-status.txt
-                    '''
-                }
+                    cat reports/k8s-status.txt
+                '''
             }
         }
 
         stage('10. Deployment and health checks') {
             when {
-                expression { params.DEPLOY }
+                expression { return params.DEPLOY }
             }
 
             steps {
-                withKube {
-                    sh '''
-                        set -eu
+                sh '''
+                    set -eu
 
-                        test -f scripts/verify-deployment.sh
+                    sudo -n -u tekuser \
+                        "$SECUREASSIST_HELPER" verify "$WORKSPACE" \
+                        > reports/verification.txt 2>&1 || {
+                            cat reports/verification.txt
+                            echo "FAIL: deployment verification failed"
+                            exit 1
+                        }
 
-                        VERIFY_MODE=pipeline \
-                            bash scripts/verify-deployment.sh
-                    '''
-                }
+                    cat reports/verification.txt
+                '''
             }
         }
     }
@@ -590,11 +364,11 @@ pipeline {
         }
 
         success {
-            echo 'SecureAssist pipeline PASSED. Review Build Artifacts for evidence.'
+            echo 'SecureAssist pipeline PASSED. Evidence is archived under Build Artifacts.'
         }
 
         failure {
-            echo 'SecureAssist pipeline FAILED. Inspect the first failed stage and its console output.'
+            echo 'SecureAssist pipeline FAILED. Inspect the first failed stage and its archived reports.'
         }
     }
 }
