@@ -4,18 +4,11 @@
 // Repository: https://github.com/tekstacUser/secureassist.git
 // Script Path: cicd/Jenkinsfile
 //
-// Jenkins controller/executor: jenkins
-// Docker builds and Minikube operations: tekuser
+// Jenkins executes the pipeline as jenkins.
+// Docker builds and Minikube operations run as tekuser via the helper.
 //
-// Prerequisite:
-// /usr/local/bin/secureassist-ci must be installed and executable.
-// Jenkins must have passwordless permission to execute ONLY this helper
-// as tekuser. Do not grant unrestricted sudo permissions.
-//
-// Helper actions:
-// check, build, load, validate, deploy, verify
-//
-// Existing Minikube cluster and credentials remain owned by tekuser.
+// Required helper: /usr/local/bin/secureassist-ci
+// Supported actions: check, build, load, validate, deploy, verify
 
 pipeline {
     agent any
@@ -75,7 +68,7 @@ pipeline {
                 sh '''
                     set -eu
 
-                    git log -1 --oneline || true
+                    git log -1 --oneline
 
                     test -f README.md
                     test -f cicd/Jenkinsfile
@@ -96,16 +89,15 @@ pipeline {
                     set -eu
 
                     test -x "$SECUREASSIST_HELPER" || {
-                        echo "FAIL: $SECUREASSIST_HELPER is missing or not executable"
+                        echo "FAIL: Helper is missing or not executable"
                         exit 1
                     }
 
-                    # Verify the narrowly scoped privilege works without a prompt.
                     sudo -n -u tekuser \
                         "$SECUREASSIST_HELPER" check "$WORKSPACE" \
                         > reports/capabilities.txt 2>&1 || {
                             cat reports/capabilities.txt
-                            echo "FAIL: tekuser environment checks failed"
+                            echo "FAIL: Environment checks failed"
                             exit 1
                         }
 
@@ -119,36 +111,38 @@ pipeline {
                 sh '''
                     set -eu
 
-                    files=$(find app mcp_server \
+                    find app mcp_server \
                         -name '*.py' \
-                        -not -path '*/__pycache__/*' | sort)
+                        -not -path '*/__pycache__/*' \
+                        -print | sort > reports/python-files.txt
 
-                    test -n "$files"
+                    test -s reports/python-files.txt
 
                     echo "Python syntax check:"
-                    echo "$files"
+                    cat reports/python-files.txt
 
                     PYTHONPYCACHEPREFIX=reports/.pycache \
-                        python3 -m py_compile $files
+                        python3 -m py_compile \
+                        $(cat reports/python-files.txt)
 
                     rm -rf reports/.pycache
 
-                    echo "syntax OK: $(echo "$files" | wc -l) files" \
+                    echo "syntax OK: $(wc -l < reports/python-files.txt) files" \
                         | tee reports/code-checks.txt
 
-                    echo "Checking backend for unsafe execution primitives"
+                    echo "Checking backend for prohibited execution primitives"
 
                     if grep -nE \
                         '^[[:space:]]*(import|from)[[:space:]]+(subprocess|pty)([[:space:]]|$)|os[.]system[(]|os[.]popen[(]|(^|[^A-Za-z_])eval[(]|(^|[^A-Za-z_])exec[(]' \
                         app/backend/*.py; then
-                        echo "FAIL: execution primitive found in app/backend"
+                        echo "FAIL: Prohibited execution primitive found"
                         exit 1
                     fi
 
                     echo "No prohibited execution primitives found" \
                         | tee -a reports/code-checks.txt
 
-                    echo "Scanning committed source for possible secrets"
+                    echo "Scanning source for possible committed secrets"
 
                     leaks=$(grep -RnE \
                         '(sk-lf-|pk-lf-)[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' \
@@ -161,7 +155,7 @@ pipeline {
 
                     if [ -n "$leaks" ]; then
                         echo "$leaks"
-                        echo "FAIL: possible secret in source"
+                        echo "FAIL: Possible secret detected"
                         exit 1
                     fi
 
@@ -178,12 +172,8 @@ pipeline {
 
             steps {
                 script {
-                    env.SONAR_SCANNER =
-                        "${tool(params.SONAR_SCANNER_TOOL)}/bin/sonar-scanner"
-
-                    env.GATE_ARGS = params.SONAR_GATE_VIA_SCANNER
-                        ? '-Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300'
-                        : ''
+                    def scannerHome = tool(params.SONAR_SCANNER_TOOL)
+                    env.SONAR_SCANNER = "${scannerHome}/bin/sonar-scanner"
                 }
 
                 withSonarQubeEnv(params.SONARQUBE_SERVER) {
@@ -196,6 +186,19 @@ pipeline {
 
                         echo
 
+                        test -x "$SONAR_SCANNER" || {
+                            echo "FAIL: SonarScanner executable not found"
+                            exit 1
+                        }
+
+                        # Build the optional flags only when requested.
+                        # No undefined GATE_ARGS variable is referenced.
+                        if [ "$SONAR_GATE_VIA_SCANNER" = "true" ]; then
+                            GATE_ARGS="-Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300"
+                        else
+                            GATE_ARGS=""
+                        fi
+
                         set +e
 
                         SONAR_TOKEN="$SONAR_AUTH_TOKEN" \
@@ -206,7 +209,6 @@ pipeline {
                             > reports/sonar-scanner-output.txt 2>&1
 
                         rc=$?
-
                         set -e
 
                         cat reports/sonar-scanner-output.txt
@@ -220,6 +222,8 @@ pipeline {
                             echo "FAIL: SonarQube analysis failed with exit $rc"
                             exit "$rc"
                         fi
+
+                        echo "SonarQube analysis completed."
                     '''
                 }
             }
@@ -244,9 +248,7 @@ pipeline {
                         )
 
                         if (qg.status != 'OK') {
-                            error(
-                                "SonarQube quality gate failed: ${qg.status}"
-                            )
+                            error("SonarQube quality gate failed: ${qg.status}")
                         }
 
                         echo "SonarQube quality gate: ${qg.status}"
@@ -300,7 +302,7 @@ pipeline {
                         "$SECUREASSIST_HELPER" validate "$WORKSPACE" \
                         > reports/manifest-validation.txt 2>&1 || {
                             cat reports/manifest-validation.txt
-                            echo "FAIL: Kubernetes manifest validation failed"
+                            echo "FAIL: Manifest validation failed"
                             exit 1
                         }
 
@@ -344,7 +346,7 @@ pipeline {
                         "$SECUREASSIST_HELPER" verify "$WORKSPACE" \
                         > reports/verification.txt 2>&1 || {
                             cat reports/verification.txt
-                            echo "FAIL: deployment verification failed"
+                            echo "FAIL: Deployment verification failed"
                             exit 1
                         }
 
@@ -368,7 +370,7 @@ pipeline {
         }
 
         failure {
-            echo 'SecureAssist pipeline FAILED. Inspect the first failed stage and its archived reports.'
+            echo 'SecureAssist pipeline FAILED. Inspect the first failed stage and archived reports.'
         }
     }
 }
