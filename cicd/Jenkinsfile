@@ -1,15 +1,3 @@
-// SecureAssist CI/CD Pipeline
-//
-// Jenkins job: SecureAssist
-// Repository: https://github.com/tekstacUser/secureassist.git
-// Script Path: cicd/Jenkinsfile
-//
-// Jenkins executes the pipeline as jenkins.
-// Docker builds and Minikube operations run as tekuser via the helper.
-//
-// Required helper: /usr/local/bin/secureassist-ci
-// Supported actions: check, build, load, validate, deploy, verify
-
 pipeline {
     agent any
 
@@ -41,26 +29,31 @@ pipeline {
         booleanParam(
             name: 'SONAR_GATE_VIA_SCANNER',
             defaultValue: false,
-            description: 'Enable if SonarQube has no Jenkins webhook'
+            description: 'Use scanner-side gate waiting if no Jenkins webhook is configured'
         )
 
         booleanParam(
             name: 'DEPLOY',
             defaultValue: true,
-            description: 'Deploy to Minikube and run verification'
+            description: 'Deploy to Minikube and verify the deployment'
         )
     }
 
     environment {
         NS = 'secureassist'
         IMAGE_TAG = '1.0'
-        POSTGRES_IMAGE = 'postgres:16.4-alpine'
+
+        FRONTEND_IMAGE = 'secureassist-frontend:1.0'
+        BACKEND_IMAGE  = 'secureassist-backend:1.0'
+        MCP_IMAGE      = 'secureassist-mcp:1.0'
+
+        MINIKUBE_PROFILE = 'minikube'
+        KUBECONFIG_FILE = '/etc/kubernetes/shared/config'
+
         PYTHONDONTWRITEBYTECODE = '1'
-        SECUREASSIST_HELPER = '/usr/local/bin/secureassist-ci'
     }
 
     stages {
-
         stage('1. Checkout') {
             steps {
                 checkout scm
@@ -88,20 +81,54 @@ pipeline {
                 sh '''
                     set -eu
 
-                    test -x "$SECUREASSIST_HELPER" || {
-                        echo "FAIL: Helper is missing or not executable"
-                        exit 1
-                    }
+                    echo "Checking execution identities"
+                    id
+                    sudo -n -u tekuser id
 
-                    sudo -n -u tekuser \
-                        "$SECUREASSIST_HELPER" check "$WORKSPACE" \
-                        > reports/capabilities.txt 2>&1 || {
-                            cat reports/capabilities.txt
-                            echo "FAIL: Environment checks failed"
+                    echo "Checking source workspace access"
+                    test -r app/frontend/Dockerfile
+                    test -r app/backend/Dockerfile
+                    test -r mcp_server/Dockerfile
+
+                    echo "Checking Docker as tekuser"
+                    sudo -n -u tekuser docker info \
+                        > reports/docker-info.txt 2>&1 || {
+                            cat reports/docker-info.txt
+                            echo "FAIL: Docker is unavailable to tekuser"
                             exit 1
                         }
 
-                    cat reports/capabilities.txt
+                    echo "Checking Minikube as tekuser"
+                    sudo -n -u tekuser minikube \
+                        -p "$MINIKUBE_PROFILE" status \
+                        > reports/minikube-status.txt 2>&1 || {
+                            cat reports/minikube-status.txt
+                            echo "FAIL: Minikube is not ready"
+                            exit 1
+                        }
+
+                    echo "Checking Kubernetes access"
+                    test -r "$KUBECONFIG_FILE"
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        cluster-info \
+                        > reports/cluster-info.txt 2>&1 || {
+                            cat reports/cluster-info.txt
+                            echo "FAIL: tekuser cannot access Kubernetes"
+                            exit 1
+                        }
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        get nodes \
+                        > reports/kubernetes-nodes.txt
+
+                    cat reports/minikube-status.txt
+                    cat reports/cluster-info.txt
+                    cat reports/kubernetes-nodes.txt
+
+                    echo "Environment checks PASSED"
                 '''
             }
         }
@@ -118,16 +145,13 @@ pipeline {
 
                     test -s reports/python-files.txt
 
-                    echo "Python syntax check:"
-                    cat reports/python-files.txt
-
                     PYTHONPYCACHEPREFIX=reports/.pycache \
                         python3 -m py_compile \
                         $(cat reports/python-files.txt)
 
                     rm -rf reports/.pycache
 
-                    echo "syntax OK: $(wc -l < reports/python-files.txt) files" \
+                    echo "Python syntax checks PASSED" \
                         | tee reports/code-checks.txt
 
                     echo "Checking backend for prohibited execution primitives"
@@ -142,7 +166,7 @@ pipeline {
                     echo "No prohibited execution primitives found" \
                         | tee -a reports/code-checks.txt
 
-                    echo "Scanning source for possible committed secrets"
+                    echo "Scanning for possible committed secrets"
 
                     leaks=$(grep -RnE \
                         '(sk-lf-|pk-lf-)[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY' \
@@ -159,7 +183,7 @@ pipeline {
                         exit 1
                     fi
 
-                    echo "No matching committed secrets found" \
+                    echo "Secret pattern check PASSED" \
                         | tee -a reports/code-checks.txt
                 '''
             }
@@ -184,30 +208,24 @@ pipeline {
                             "$SONAR_HOST_URL/api/system/status" \
                             | tee reports/sonar-server-status.json
 
-                        echo
-
                         test -x "$SONAR_SCANNER" || {
-                            echo "FAIL: SonarScanner executable not found"
+                            echo "FAIL: SonarScanner not found"
                             exit 1
                         }
 
-                        # Build the optional flags only when requested.
-                        # No undefined GATE_ARGS variable is referenced.
+                        GATE_ARGS=""
+
                         if [ "$SONAR_GATE_VIA_SCANNER" = "true" ]; then
                             GATE_ARGS="-Dsonar.qualitygate.wait=true -Dsonar.qualitygate.timeout=300"
-                        else
-                            GATE_ARGS=""
                         fi
 
                         set +e
-
                         SONAR_TOKEN="$SONAR_AUTH_TOKEN" \
                             "$SONAR_SCANNER" \
                             -Dsonar.host.url="$SONAR_HOST_URL" \
                             -Dsonar.projectVersion="$IMAGE_TAG-$BUILD_NUMBER" \
                             $GATE_ARGS \
                             > reports/sonar-scanner-output.txt 2>&1
-
                         rc=$?
                         set -e
 
@@ -219,11 +237,11 @@ pipeline {
                         fi
 
                         if [ "$rc" -ne 0 ]; then
-                            echo "FAIL: SonarQube analysis failed with exit $rc"
+                            echo "FAIL: SonarQube analysis or scanner-side gate failed"
                             exit "$rc"
                         fi
 
-                        echo "SonarQube analysis completed."
+                        echo "SonarQube analysis completed"
                     '''
                 }
             }
@@ -262,13 +280,37 @@ pipeline {
                 sh '''
                     set -eu
 
-                    sudo -n -u tekuser \
-                        "$SECUREASSIST_HELPER" build "$WORKSPACE" \
-                        > reports/images.txt 2>&1 || {
-                            cat reports/images.txt
-                            echo "FAIL: Docker image build failed"
+                    echo "Building frontend"
+                    sudo -n -u tekuser docker build \
+                        -t "$FRONTEND_IMAGE" \
+                        -f app/frontend/Dockerfile . \
+                        > reports/frontend-build.txt 2>&1 || {
+                            cat reports/frontend-build.txt
                             exit 1
                         }
+
+                    echo "Building backend"
+                    sudo -n -u tekuser docker build \
+                        -t "$BACKEND_IMAGE" \
+                        -f app/backend/Dockerfile . \
+                        > reports/backend-build.txt 2>&1 || {
+                            cat reports/backend-build.txt
+                            exit 1
+                        }
+
+                    echo "Building MCP server"
+                    sudo -n -u tekuser docker build \
+                        -t "$MCP_IMAGE" \
+                        -f mcp_server/Dockerfile . \
+                        > reports/mcp-build.txt 2>&1 || {
+                            cat reports/mcp-build.txt
+                            exit 1
+                        }
+
+                    sudo -n -u tekuser docker image inspect \
+                        "$FRONTEND_IMAGE" "$BACKEND_IMAGE" "$MCP_IMAGE" \
+                        --format '{{.RepoTags}}' \
+                        > reports/images.txt
 
                     cat reports/images.txt
                 '''
@@ -280,13 +322,16 @@ pipeline {
                 sh '''
                     set -eu
 
-                    sudo -n -u tekuser \
-                        "$SECUREASSIST_HELPER" load "$WORKSPACE" \
-                        > reports/minikube-images.txt 2>&1 || {
-                            cat reports/minikube-images.txt
-                            echo "FAIL: Minikube image loading failed"
-                            exit 1
-                        }
+                    for image in "$FRONTEND_IMAGE" "$BACKEND_IMAGE" "$MCP_IMAGE"; do
+                        echo "Loading $image"
+
+                        sudo -n -u tekuser minikube \
+                            -p "$MINIKUBE_PROFILE" image load "$image"
+                    done
+
+                    sudo -n -u tekuser minikube \
+                        -p "$MINIKUBE_PROFILE" image ls \
+                        > reports/minikube-images.txt
 
                     cat reports/minikube-images.txt
                 '''
@@ -298,15 +343,64 @@ pipeline {
                 sh '''
                     set -eu
 
-                    sudo -n -u tekuser \
-                        "$SECUREASSIST_HELPER" validate "$WORKSPACE" \
-                        > reports/manifest-validation.txt 2>&1 || {
-                            cat reports/manifest-validation.txt
-                            echo "FAIL: Manifest validation failed"
-                            exit 1
-                        }
+                    echo "Checking all manifests client-side"
+
+                    for f in \
+                        k8s/namespace.yaml \
+                        k8s/langfuse-db-deployment.yaml \
+                        k8s/langfuse-db-service.yaml \
+                        k8s/langfuse-deployment.yaml \
+                        k8s/langfuse-service.yaml \
+                        k8s/mcp-deployment.yaml \
+                        k8s/mcp-service.yaml \
+                        k8s/backend-deployment.yaml \
+                        k8s/backend-service.yaml \
+                        k8s/frontend-deployment.yaml \
+                        k8s/frontend-service.yaml
+                    do
+                        kubectl apply --dry-run=client -f "$f" \
+                            >> reports/manifest-validation.txt
+                        echo "CLIENT OK: $f" \
+                            | tee -a reports/manifest-validation.txt
+                    done
+
+                    echo "Checking Kubernetes server-side validation"
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        apply --dry-run=server -f k8s/namespace.yaml \
+                        > reports/server-validation.txt
+
+                    if sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        get namespace "$NS" >/dev/null 2>&1; then
+
+                        for f in \
+                            k8s/langfuse-db-deployment.yaml \
+                            k8s/langfuse-db-service.yaml \
+                            k8s/langfuse-deployment.yaml \
+                            k8s/langfuse-service.yaml \
+                            k8s/mcp-deployment.yaml \
+                            k8s/mcp-service.yaml \
+                            k8s/backend-deployment.yaml \
+                            k8s/backend-service.yaml \
+                            k8s/frontend-deployment.yaml \
+                            k8s/frontend-service.yaml
+                        do
+                            sudo -n -u tekuser kubectl \
+                                --kubeconfig="$KUBECONFIG_FILE" \
+                                apply --dry-run=server -f "$f" \
+                                >> reports/server-validation.txt
+                            echo "SERVER OK: $f" \
+                                | tee -a reports/server-validation.txt
+                        done
+                    else
+                        echo "Namespace does not exist yet; namespaced server validation is deferred until deployment." \
+                            | tee -a reports/server-validation.txt
+                    fi
 
                     cat reports/manifest-validation.txt
+                    cat reports/server-validation.txt
                 '''
             }
         }
@@ -320,13 +414,49 @@ pipeline {
                 sh '''
                     set -eu
 
-                    sudo -n -u tekuser \
-                        "$SECUREASSIST_HELPER" deploy "$WORKSPACE" \
-                        > reports/k8s-status.txt 2>&1 || {
-                            cat reports/k8s-status.txt
-                            echo "FAIL: SecureAssist deployment failed"
+                    K="sudo -n -u tekuser kubectl"
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        apply -f k8s/namespace.yaml
+
+                    # The Langfuse credentials must be provisioned
+                    # separately. Never commit secrets into Git.
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" get secret secureassist-langfuse \
+                        >/dev/null || {
+                            echo "FAIL: Secret secureassist-langfuse is missing."
+                            echo "Create it securely before deploying."
                             exit 1
                         }
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        apply \
+                        -f k8s/langfuse-db-deployment.yaml \
+                        -f k8s/langfuse-db-service.yaml \
+                        -f k8s/langfuse-deployment.yaml \
+                        -f k8s/langfuse-service.yaml \
+                        -f k8s/mcp-deployment.yaml \
+                        -f k8s/mcp-service.yaml \
+                        -f k8s/backend-deployment.yaml \
+                        -f k8s/backend-service.yaml \
+                        -f k8s/frontend-deployment.yaml \
+                        -f k8s/frontend-service.yaml
+
+                    for d in langfuse-db langfuse mcp backend frontend; do
+                        sudo -n -u tekuser kubectl \
+                            --kubeconfig="$KUBECONFIG_FILE" \
+                            -n "$NS" rollout status \
+                            "deployment/secureassist-$d" \
+                            --timeout=420s
+                    done
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" get deploy,pods,svc,pvc \
+                        > reports/k8s-status.txt
 
                     cat reports/k8s-status.txt
                 '''
@@ -342,15 +472,67 @@ pipeline {
                 sh '''
                     set -eu
 
-                    sudo -n -u tekuser \
-                        "$SECUREASSIST_HELPER" verify "$WORKSPACE" \
-                        > reports/verification.txt 2>&1 || {
-                            cat reports/verification.txt
-                            echo "FAIL: Deployment verification failed"
-                            exit 1
-                        }
+                    K="sudo -n -u tekuser kubectl"
 
+                    # Confirm that all deployments have an available replica.
+                    for d in langfuse-db langfuse mcp backend frontend; do
+                        sudo -n -u tekuser kubectl \
+                            --kubeconfig="$KUBECONFIG_FILE" \
+                            -n "$NS" rollout status \
+                            "deployment/secureassist-$d" \
+                            --timeout=120s
+                    done
+
+                    # Check local health endpoints inside each application pod.
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" exec deployment/secureassist-frontend -- \
+                        python -c \
+                        'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8091/health",timeout=10); print("frontend HTTP",r.status); assert r.status==200' \
+                        > reports/frontend-health.txt
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" exec deployment/secureassist-backend -- \
+                        python -c \
+                        'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8092/health",timeout=10); print("backend HTTP",r.status); assert r.status==200' \
+                        > reports/backend-health.txt
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" exec deployment/secureassist-backend -- \
+                        python -c \
+                        'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8092/ready?deep=true",timeout=20); print("backend deep readiness HTTP",r.status); print(r.read().decode()); assert r.status==200' \
+                        > reports/backend-readiness.txt
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" exec deployment/secureassist-mcp -- \
+                        python -c \
+                        'import urllib.request; r=urllib.request.urlopen("http://127.0.0.1:8093/health",timeout=10); print("MCP HTTP",r.status); assert r.status==200' \
+                        > reports/mcp-health.txt
+
+                    # Check Langfuse from inside its Node.js container.
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" exec deployment/secureassist-langfuse -- \
+                        node -e \
+                        'require("http").get("http://127.0.0.1:3031/api/public/health",r=>{console.log("Langfuse HTTP",r.statusCode);process.exit(r.statusCode===200?0:1)}).on("error",e=>{console.error(e);process.exit(1)})' \
+                        > reports/langfuse-health.txt
+
+                    sudo -n -u tekuser kubectl \
+                        --kubeconfig="$KUBECONFIG_FILE" \
+                        -n "$NS" get deploy,pods,svc,pvc \
+                        > reports/verification.txt
+
+                    cat reports/frontend-health.txt
+                    cat reports/backend-health.txt
+                    cat reports/backend-readiness.txt
+                    cat reports/mcp-health.txt
+                    cat reports/langfuse-health.txt
                     cat reports/verification.txt
+
+                    echo "All deployment health checks PASSED"
                 '''
             }
         }
