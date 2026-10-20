@@ -29,7 +29,7 @@ pipeline {
 
         string(
             name: 'SONARQUBE_SERVER',
-            defaultValue: 'SonarQube',
+            defaultValue: 'sonarqube',
             description: 'Exact SonarQube server name configured in Jenkins'
         )
 
