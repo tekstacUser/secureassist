@@ -410,6 +410,94 @@ pipeline {
                 '''
             }
         }
+
+        stage('11. Start port-forwards and verify application') {
+            when {
+                expression { params.DEPLOY }
+            }
+            steps {
+                sh '''
+                    set -eu
+                    mkdir -p reports
+        
+                    echo "=== Clear ports 8091, 8097, 8093 and 3031 ==="
+        
+                    if ! command -v fuser >/dev/null 2>&1; then
+                        echo "ERROR: fuser is required to clear ports."
+                        exit 1
+                    fi
+        
+                    for port in 8091 8097 8093 3031; do
+                        echo "Checking port $port"
+                        fuser -k "$port/tcp" 2>/dev/null || true
+                    done
+        
+                    sleep 2
+        
+                    echo "=== Configure Minikube access ==="
+                    export HOME=/home/tekuser
+                    export MINIKUBE_HOME=/home/tekuser/.minikube
+                    export KUBECONFIG=/etc/kubernetes/shared/config
+        
+                    echo "=== Start frontend on 8091 (external access) ==="
+                    nohup kubectl -n secureassist port-forward \
+                        --address 0.0.0.0 \
+                        svc/secureassist-frontend 8091:8091 \
+                        > reports/forward-frontend.log 2>&1 < /dev/null &
+        
+                    echo "=== Start backend on 8097 (VM-local only) ==="
+                    nohup kubectl -n secureassist port-forward \
+                        --address 127.0.0.1 \
+                        svc/secureassist-backend 8097:8092 \
+                        > reports/forward-backend.log 2>&1 < /dev/null &
+        
+                    echo "=== Start MCP on 8093 (VM-local only) ==="
+                    nohup kubectl -n secureassist port-forward \
+                        --address 127.0.0.1 \
+                        svc/secureassist-mcp 8093:8093 \
+                        > reports/forward-mcp.log 2>&1 < /dev/null &
+        
+                    echo "=== Start Langfuse on 3031 (external access) ==="
+                    nohup kubectl -n secureassist port-forward \
+                        --address 0.0.0.0 \
+                        svc/secureassist-langfuse 3031:3031 \
+                        > reports/forward-langfuse.log 2>&1 < /dev/null &
+        
+                    echo "=== Wait for port-forwards ==="
+                    sleep 5
+        
+                    echo "=== Verify frontend ==="
+                    curl --retry 5 --retry-delay 2 --retry-connrefused \
+                        -fsS http://127.0.0.1:8091/health
+                    echo
+        
+                    echo "=== Verify backend ==="
+                    curl --retry 5 --retry-delay 2 --retry-connrefused \
+                        -fsS http://127.0.0.1:8097/health
+                    echo
+        
+                    echo "=== Verify backend deep readiness ==="
+                    curl --retry 5 --retry-delay 2 --retry-connrefused \
+                        -fsS 'http://127.0.0.1:8097/ready?deep=true' \
+                        | python3 -m json.tool
+        
+                    echo "=== Verify MCP ==="
+                    curl --retry 5 --retry-delay 2 --retry-connrefused \
+                        -fsS http://127.0.0.1:8093/health
+                    echo
+        
+                    echo "=== Verify Langfuse ==="
+                    curl --retry 5 --retry-delay 2 --retry-connrefused \
+                        -fsS http://127.0.0.1:3031/api/public/health
+                    echo
+        
+                    echo "=== Port-forward processes ==="
+                    pgrep -af '[k]ubectl.*port-forward' || true
+        
+                    echo "Port-forward setup and health checks: PASS"
+                '''
+            }
+        }
     }
 
     post {
