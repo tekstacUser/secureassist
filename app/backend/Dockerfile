@@ -25,4 +25,4 @@ EXPOSE 8092
 
 # 2 workers x 4 threads; long timeout because phi3:mini on CPU can be slow
 CMD ["gunicorn", "--bind", "0.0.0.0:8092", "--workers", "2", "--threads", "4", \
-     "--timeout", "150", "--access-logfile", "-", "app:app"]
+     "--timeout", "330", "--access-logfile", "-", "app:app"]
