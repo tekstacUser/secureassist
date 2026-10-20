@@ -399,7 +399,7 @@ pipeline {
 
                     echo "=== Langfuse health ==="
                     kubectl -n "$NS" exec deployment/secureassist-langfuse -- \
-                        node -e "fetch('http://127.0.0.1:3031/api/public/health').then(async r => { const body = await r.text(); console.log(body); if (!r.ok) process.exit(1); }).catch(e => { console.error(e); process.exit(1); })"
+                        node -e "fetch('http://127.0.0.1:3000/api/public/health').then(async r => { const body = await r.text(); console.log(body); if (!r.ok) process.exit(1); }).catch(e => { console.error(e); process.exit(1); })"
 
                     echo "=== Final deployment status ==="
                     kubectl -n "$NS" get deployments
