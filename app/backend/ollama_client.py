@@ -8,7 +8,7 @@ Environment variables:
                           use http://localhost:11434 when running on the VM
   OLLAMA_MODEL            default phi3:mini
   OLLAMA_CONNECT_TIMEOUT  seconds to open the TCP connection (default 5)
-  OLLAMA_READ_TIMEOUT     seconds to wait for the answer   (default 120, CPU is slow)
+  OLLAMA_READ_TIMEOUT     seconds to wait for the answer   (default 300, CPU is slow)
   OLLAMA_NUM_PREDICT      max tokens to generate            (default 256)
 """
 
@@ -19,7 +19,7 @@ import requests
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.minikube.internal:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
 CONNECT_TIMEOUT = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "5"))
-READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "120"))
+READ_TIMEOUT = float(os.getenv("OLLAMA_READ_TIMEOUT", "300"))
 NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "256"))
 
 SYSTEM_PROMPT = (
