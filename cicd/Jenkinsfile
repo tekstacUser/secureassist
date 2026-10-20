@@ -255,7 +255,7 @@ pipeline {
             }
         }
 
-        stage('7. Load images into Minikube as jenkins') {
+        stage('7. Load images into Minikube as tekuser') {
             when {
                 expression { params.DEPLOY }
             }
@@ -263,22 +263,18 @@ pipeline {
                 sh '''
                     set -eu
 
-                    export HOME=/home/tekuser
-                    export MINIKUBE_HOME=/home/tekuser/.minikube
-                    export KUBECONFIG=/etc/kubernetes/shared/config
+                    mkdir -p reports
 
-                    echo "=== Load frontend image ==="
-                    minikube -p "$MINIKUBE_PROFILE" image load "$FRONTEND_IMAGE"
+                    echo "=== Load and verify images as tekuser ==="
 
-                    echo "=== Load backend image ==="
-                    minikube -p "$MINIKUBE_PROFILE" image load "$BACKEND_IMAGE"
-
-                    echo "=== Load MCP image ==="
-                    minikube -p "$MINIKUBE_PROFILE" image load "$MCP_IMAGE"
-
-                    echo "=== Verify image availability ==="
-                    minikube -p "$MINIKUBE_PROFILE" image ls |
-                        tee reports/minikube-images.txt
+                    if sudo -u tekuser /usr/local/bin/secureassist-ci \
+                        > reports/minikube-images.txt 2>&1; then
+                        cat reports/minikube-images.txt
+                    else
+                        cat reports/minikube-images.txt
+                        echo "ERROR: Minikube image loading failed."
+                        exit 1
+                    fi
 
                     grep -F "$FRONTEND_IMAGE" reports/minikube-images.txt
                     grep -F "$BACKEND_IMAGE" reports/minikube-images.txt
