@@ -420,84 +420,114 @@ pipeline {
                     set -eu
                     mkdir -p reports
         
-                    echo "=== Clear ports 8091, 8097, 8093 and 3031 ==="
-        
-                    if ! command -v fuser >/dev/null 2>&1; then
-                        echo "ERROR: fuser is required to clear ports."
-                        exit 1
-                    fi
-        
-                    for port in 8091 8097 8093 3031; do
-                        echo "Checking port $port"
-                        fuser -k "$port/tcp" 2>/dev/null || true
-                    done
-        
-                    sleep 2
-        
                     echo "=== Configure Minikube access ==="
                     export HOME=/home/tekuser
                     export MINIKUBE_HOME=/home/tekuser/.minikube
                     export KUBECONFIG=/etc/kubernetes/shared/config
         
-                    echo "=== Start frontend on 8091 (external access) ==="
+                    # Prevent Jenkins from killing these background processes
+                    # when the pipeline shell exits.
+                    export JENKINS_NODE_COOKIE=dontKillMe
+                    export BUILD_ID=dontKillMe
+        
+                    echo "=== Check required commands ==="
+                    for cmd in kubectl curl python3 fuser; do
+                        command -v "$cmd" >/dev/null 2>&1 || {
+                            echo "ERROR: Required command not found: $cmd"
+                            exit 1
+                        }
+                    done
+        
+                    echo "=== Clear old port-forward processes ==="
+                    for port in 8091 8097 8093 3031; do
+                        fuser -k "$port/tcp" 2>/dev/null || true
+                    done
+        
+                    sleep 2
+        
+                    echo "=== Start frontend on 8091 ==="
                     nohup kubectl -n secureassist port-forward \
                         --address 0.0.0.0 \
                         svc/secureassist-frontend 8091:8091 \
                         > reports/forward-frontend.log 2>&1 < /dev/null &
         
-                    echo "=== Start backend on 8097 (VM-local only) ==="
+                    echo "=== Start backend on 8097 ==="
                     nohup kubectl -n secureassist port-forward \
                         --address 127.0.0.1 \
                         svc/secureassist-backend 8097:8092 \
                         > reports/forward-backend.log 2>&1 < /dev/null &
         
-                    echo "=== Start MCP on 8093 (VM-local only) ==="
+                    echo "=== Start MCP on 8093 ==="
                     nohup kubectl -n secureassist port-forward \
                         --address 127.0.0.1 \
                         svc/secureassist-mcp 8093:8093 \
                         > reports/forward-mcp.log 2>&1 < /dev/null &
         
-                    echo "=== Start Langfuse on 3031 (external access) ==="
+                    echo "=== Start Langfuse on 3031 ==="
                     nohup kubectl -n secureassist port-forward \
                         --address 0.0.0.0 \
                         svc/secureassist-langfuse 3031:3031 \
                         > reports/forward-langfuse.log 2>&1 < /dev/null &
         
-                    echo "=== Wait for port-forwards ==="
-                    sleep 5
+                    echo "=== Wait for services and verify health ==="
         
-                    echo "=== Verify frontend ==="
-                    curl --retry 5 --retry-delay 2 --retry-connrefused \
-                        -fsS http://127.0.0.1:8091/health
-                    echo
+                    check_endpoint() {
+                        name="$1"
+                        url="$2"
+                        attempt=1
         
-                    echo "=== Verify backend ==="
-                    curl --retry 5 --retry-delay 2 --retry-connrefused \
-                        -fsS http://127.0.0.1:8097/health
-                    echo
+                        while [ "$attempt" -le 15 ]; do
+                            if curl -fsS --max-time 3 "$url"; then
+                                echo
+                                echo "$name: PASS"
+                                return 0
+                            fi
         
-                    echo "=== Verify backend deep readiness ==="
-                    curl --retry 5 --retry-delay 2 --retry-connrefused \
-                        -fsS 'http://127.0.0.1:8097/ready?deep=true' \
+                            echo "$name not ready yet (attempt $attempt/15)"
+                            sleep 2
+                            attempt=$((attempt + 1))
+                        done
+        
+                        echo "ERROR: $name health check failed: $url"
+                        return 1
+                    }
+        
+                    check_endpoint "Frontend" \
+                        "http://127.0.0.1:8091/health"
+        
+                    check_endpoint "Backend" \
+                        "http://127.0.0.1:8097/health"
+        
+                    echo "=== Backend deep readiness ==="
+                    curl -fsS --max-time 10 \
+                        "http://127.0.0.1:8097/ready?deep=true" \
                         | python3 -m json.tool
         
-                    echo "=== Verify MCP ==="
-                    curl --retry 5 --retry-delay 2 --retry-connrefused \
-                        -fsS http://127.0.0.1:8093/health
-                    echo
+                    check_endpoint "MCP" \
+                        "http://127.0.0.1:8093/health"
         
-                    echo "=== Verify Langfuse ==="
-                    curl --retry 5 --retry-delay 2 --retry-connrefused \
-                        -fsS http://127.0.0.1:3031/api/public/health
-                    echo
+                    check_endpoint "Langfuse" \
+                        "http://127.0.0.1:3031/api/public/health"
         
-                    echo "=== Port-forward processes ==="
+                    echo "=== Verify port-forward processes ==="
                     pgrep -af '[k]ubectl.*port-forward' || true
         
-                    echo "Port-forward setup and health checks: PASS"
+                    echo "=== Port-forward logs (last lines) ==="
+                    for logfile in \
+                        reports/forward-frontend.log \
+                        reports/forward-backend.log \
+                        reports/forward-mcp.log \
+                        reports/forward-langfuse.log
+                    do
+                        echo "--- $logfile ---"
+                        tail -n 5 "$logfile" || true
+                    done
+        
+                    echo "=== Port-forward setup and health checks: PASS ==="
                 '''
             }
         }
+
     }
 
     post {
